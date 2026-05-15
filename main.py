@@ -1,58 +1,59 @@
 import re
-
-def parse_srt(file_content):
-    # SRT ဖိုင်ထဲက အချိန်မှတ်တွေနဲ့ စာသားတွေကို ခွဲထုတ်တဲ့ Logic
-    # pattern က SRT format (index, timestamp, text) ကို ရှာဖို့ဖြစ်ပါတယ်
-    pattern = re.compile(r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\Z)')
-    matches = pattern.findall(file_content)
-    
-    subtitles = []
-    for m in matches:
-        subtitles.append({
-            "index": m[0],
-            "timestamp": m[1],
-            "text": m[2].strip()
-        })
-    return subtitles
-
-# စမ်းသပ်ကြည့်ဖို့ (Test run)
-if __name__ == "__main__":
-    sample_data = "1\n00:00:01,000 --> 00:00:04,000\nHello, how are you?\n\n2\n00:00:05,000 --> 00:00:08,000\nWelcome to our app."
-    result = parse_srt(sample_data)
-    for sub in result:
-        print(f"Index {sub['index']}: {sub['text']}")import google.generativeai as genai
+import google.generativeai as genai
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-def get_gemini_response(api_key, model_name, text_content):
-    # API Key ကို ဝင်လာတဲ့ request အတိုင်း configure လုပ်မယ်
-    genai.configure(api_key=api_key)
-    
-    # model_name က 'gemini-1.5-flash' သို့မဟုတ် 'gemini-1.5-pro' ဖြစ်နိုင်ပါတယ်
-    model = genai.GenerativeModel(model_name)
-    
-    prompt = f"Translate these SRT subtitles to Burmese carefully: \n{text_content}"
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error: {str(e)}"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def parse_srt(file_content):
+    pattern = re.compile(r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\n([\s\S]*?)(?=\n\n|\Z)')
+    return [{"index": m[0], "timestamp": m[1], "text": m[2].strip()} for m in pattern.findall(file_content)]
 
 @app.post("/translate")
-async def translate_srt(
+async def translate_api(
     api_key: str = Form(...), 
-    model_choice: str = Form("gemini-1.5-flash"), # default ကို flash ထားမယ်
+    model_choice: str = Form(...), 
+    target_lang: str = Form("Burmese"), # ဘာသာစကား ရွေးချယ်မှုအသစ်
     file: UploadFile = File(...)
 ):
-    # ၁။ ဖိုင်ကို ဖတ်မယ်
-    content = await file.read()
-    srt_text = content.decode("utf-8")
+    content = (await file.read()).decode("utf-8")
+    subtitles = parse_srt(content)
     
-    # ၂။ SRT ကို parse လုပ်ပြီး စာသားတွေကိုပဲ ထုတ်မယ် (ယခင် အဆင့်က code ကို သုံးမယ်)
-    # ၃။ Gemini ဆီ ပို့မယ်
-    translated_result = get_gemini_response(api_key, model_choice, srt_text)
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_choice)
     
-    return {"translated_text": translated_result}
+    chunk_size = 20
+    translated_all = []
+    
+    # စုစုပေါင်း chunk အရေအတွက်ကို တွက်ချက်ခြင်း
+    total_chunks = (len(subtitles) + chunk_size - 1) // chunk_size
 
+    for i in range(0, len(subtitles), chunk_size):
+        chunk = [s['text'] for s in subtitles[i:i + chunk_size]]
+        prompt = f"Translate the following subtitles into {target_lang}. Keep the exact same number of lines and do not add any explanations:\n" + "\n".join(chunk)
+        
+        try:
+            response = model.generate_content(prompt)
+            translated_lines = response.text.strip().split('\n')
+            # line count မကိုက်ရင် မူရင်းအတိုင်း ခေတ္တထားမယ်
+            if len(translated_lines) != len(chunk):
+                translated_all.extend(chunk)
+            else:
+                translated_all.extend(translated_lines)
+        except:
+            translated_all.extend(chunk)
+
+    # SRT ပြန်လည်တည်ဆောက်ခြင်း
+    output = ""
+    for i in range(len(subtitles)):
+        trans_text = translated_all[i] if i < len(translated_all) else subtitles[i]['text']
+        output += f"{subtitles[i]['index']}\n{subtitles[i]['timestamp']}\n{trans_text}\n\n"
+        
+    return {"translated_srt": output}
